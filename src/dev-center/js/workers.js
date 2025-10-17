@@ -399,6 +399,12 @@ $(document).on('click', '.options-icon-worker', function (e) {
     puter.ui.contextMenu({
         items: [
             {
+                label: 'View Logs',
+                action: () => {
+                    show_worker_logs($(this).attr('data-worker-name'));
+                },
+            },
+            {
                 label: 'Delete',
                 type: 'danger',
                 action: () => {
@@ -408,6 +414,297 @@ $(document).on('click', '.options-icon-worker', function (e) {
         ],
     });
 })
+
+let activeLogHandles = {};
+
+function format_log_entry(data) {
+    try {
+        // If it's a string, try to parse it
+        const logData = typeof data === 'string' ? JSON.parse(data) : data;
+        
+        let formatted = '';
+        
+        // Format request info
+        if (logData.event?.request) {
+            const req = logData.event.request;
+            const statusCode = logData.event.response?.status || '---';
+            const statusColor = statusCode >= 200 && statusCode < 300 ? '#4caf50' : 
+                               statusCode >= 400 ? '#f44336' : '#ff9800';
+            
+            formatted += `<div style="margin-bottom: 8px; padding: 8px; background: #2d2d2d; border-left: 3px solid ${statusColor}; font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', monospace;">`;
+            formatted += `<div style="margin-bottom: 6px;"><span style="color: #61afef; font-weight: bold; font-family: monospace;">${html_encode(req.method)}</span> <span style="color: #98c379; font-family: monospace;">${html_encode(req.url)}</span></div>`;
+            formatted += `<div style="color: #abb2bf; font-size: 12px; margin-bottom: 6px;">Status: <span style="color: ${statusColor}; font-weight: bold;">${statusCode}</span></div>`;
+            
+            // Show important headers
+            if (req.headers) {
+                const importantHeaders = ['user-agent', 'cf-ipcountry', 'cf-connecting-ip', 'x-real-ip', 'content-type', 'authorization'];
+                const headerEntries = Object.entries(req.headers).filter(([key]) => 
+                    importantHeaders.includes(key.toLowerCase())
+                );
+                
+                if (headerEntries.length > 0) {
+                    formatted += `<div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #404040;">`;
+                    formatted += `<div style="color: #61afef; font-size: 11px; margin-bottom: 4px;">Key Headers:</div>`;
+                    headerEntries.forEach(([key, value]) => {
+                        formatted += `<div style="font-size: 11px; color: #858585; margin-left: 8px; font-family: monospace;">`;
+                        formatted += `<span style="color: #c678dd; font-family: monospace;">${html_encode(key)}</span>: `;
+                        formatted += `<span style="color: #abb2bf; font-family: monospace;">${html_encode(String(value).substring(0, 100))}${String(value).length > 100 ? '...' : ''}</span>`;
+                        formatted += `</div>`;
+                    });
+                    formatted += `</div>`;
+                }
+                
+                // Add expandable section for all headers
+                const headerId = `headers-${Math.random().toString(36).substr(2, 9)}`;
+                formatted += `<div style="margin-top: 6px;">`;
+                formatted += `<span style="color: #61afef; font-size: 11px; cursor: pointer; text-decoration: underline;" onclick="document.getElementById('${headerId}').style.display = document.getElementById('${headerId}').style.display === 'none' ? 'block' : 'none';">Show all headers (${Object.keys(req.headers).length})</span>`;
+                formatted += `<div id="${headerId}" style="display: none; margin-top: 4px; padding: 4px; background: #252525; font-size: 10px; max-height: 200px; overflow-y: auto;">`;
+                formatted += `<pre style="margin: 0; color: #abb2bf; white-space: pre-wrap; word-break: break-all;">${html_encode(JSON.stringify(req.headers, null, 2))}</pre>`;
+                formatted += `</div></div>`;
+            }
+            
+            formatted += `</div>`;
+        }
+        
+        // Format logs array
+        if (logData.logs && Array.isArray(logData.logs) && logData.logs.length > 0) {
+            logData.logs.forEach(log => {
+                const levelColors = {
+                    'log': '#61afef',
+                    'info': '#56b6c2',
+                    'warn': '#e5c07b',
+                    'error': '#e06c75',
+                    'debug': '#c678dd'
+                };
+                const levelColor = levelColors[log.level] || '#abb2bf';
+                
+                formatted += `<div style="margin-bottom: 4px; padding: 6px 12px; background: #262626; font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', monospace;">`;
+                formatted += `<span style="color: ${levelColor}; font-weight: bold;">[${log.level.toUpperCase()}]</span> `;
+                
+                // Show timestamp if available
+                if (log.timestamp) {
+                    const logTime = new Date(log.timestamp);
+                    formatted += `<span style="color: #858585; font-size: 11px;">${logTime.toLocaleTimeString()}.${String(logTime.getMilliseconds()).padStart(3, '0')}</span> `;
+                }
+                
+                // Format the message
+                if (Array.isArray(log.message)) {
+                    log.message.forEach((msg, idx) => {
+                        if (idx > 0) formatted += ' ';
+                        if (typeof msg === 'object') {
+                            formatted += `<span style="color: #d19a66;">${html_encode(JSON.stringify(msg, null, 2))}</span>`;
+                        } else {
+                            formatted += `<span style="color: #abb2bf;">${html_encode(String(msg))}</span>`;
+                        }
+                    });
+                } else {
+                    formatted += `<span style="color: #abb2bf;">${html_encode(String(log.message))}</span>`;
+                }
+                formatted += `</div>`;
+            });
+        }
+        
+        // Format exceptions
+        if (logData.exceptions && Array.isArray(logData.exceptions) && logData.exceptions.length > 0) {
+            logData.exceptions.forEach(exception => {
+                formatted += `<div style="margin-bottom: 4px; padding: 8px; background: #3d1f1f; border-left: 3px solid #f44336; font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', monospace;">`;
+                formatted += `<span style="color: #f44336; font-weight: bold;">⚠ EXCEPTION:</span><br>`;
+                formatted += `<pre style="margin: 4px 0 0 0; color: #e06c75; white-space: pre-wrap; word-break: break-all; font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', monospace;">${html_encode(JSON.stringify(exception, null, 2))}</pre>`;
+                formatted += `</div>`;
+            });
+        }
+        
+        // Show worker name if available
+        if (logData.workerName) {
+            formatted += `<div style="margin-top: 6px; font-size: 11px; color: #858585; font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', monospace;">Worker: <span style="color: #c678dd; font-family: monospace;">${html_encode(logData.workerName)}</span></div>`;
+        }
+        
+        // Show outcome
+        if (logData.outcome) {
+            const outcomeColor = logData.outcome === 'ok' ? '#4caf50' : '#e5c07b';
+            formatted += `<div style="margin-top: 4px; font-size: 11px; color: #858585; font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', monospace;">Outcome: <span style="color: ${outcomeColor}; font-weight: bold;">${html_encode(logData.outcome)}</span></div>`;
+        }
+        
+        // If nothing was formatted, fall back to JSON
+        if (!formatted) {
+            formatted = `<pre style="margin: 0; color: #abb2bf; white-space: pre-wrap; word-break: break-all; font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', monospace;">${html_encode(JSON.stringify(logData, null, 2))}</pre>`;
+        }
+        
+        return formatted;
+    } catch (err) {
+        // If parsing fails, return as plain text
+        return `<span style="color: #abb2bf; font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', monospace;">${html_encode(String(data))}</span>`;
+    }
+}
+
+async function show_worker_logs(worker_name) {
+    // Create modal HTML
+    const modal_id = `worker-logs-modal-${worker_name.replace(/[^a-zA-Z0-9]/g, '_')}`;
+    
+    // Remove existing modal if it exists
+    $(`#${modal_id}`).remove();
+    
+    // Stop existing log handle if it exists
+    if (activeLogHandles[worker_name]) {
+        activeLogHandles[worker_name].removeEventListener("log", activeLogHandles[worker_name].logHandler);
+        activeLogHandles[worker_name] = null;
+    }
+    
+    const modal_html = `
+        <div id="${modal_id}" class="worker-logs-modal" style="
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 80%;
+            max-width: 900px;
+            max-height: 80vh;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+            z-index: 10000;
+            display: flex;
+            flex-direction: column;
+        ">
+            <div style="
+                padding: 20px;
+                border-bottom: 1px solid #e0e0e0;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            ">
+                <h2 style="margin: 0; font-size: 18px; font-weight: 600;">Logs: ${html_encode(worker_name)}</h2>
+                <button class="close-logs-modal" style="
+                    background: none;
+                    border: none;
+                    font-size: 24px;
+                    cursor: pointer;
+                    padding: 0;
+                    width: 30px;
+                    height: 30px;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    color: #666;
+                ">&times;</button>
+            </div>
+            <div class="logs-content" style="
+                flex: 1;
+                overflow-y: auto;
+                padding: 20px;
+                font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', monospace;
+                font-size: 13px;
+                line-height: 1.5;
+                background: #1e1e1e;
+                color: #d4d4d4;
+            ">
+                <div class="log-entries">
+                    <div class="waiting-for-logs" style="
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        height: 100%;
+                        min-height: 200px;
+                        color: #858585;
+                        font-style: italic;
+                        font-size: 14px;
+                    ">Waiting for logs...</div>
+                </div>
+            </div>
+            <div style="
+                padding: 15px 20px;
+                border-top: 1px solid #e0e0e0;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                background: #f8f8f8;
+            ">
+                <button class="clear-logs-btn" style="
+                    padding: 8px 16px;
+                    background: #f44336;
+                    color: white;
+                    border: none;
+                    border-radius: 4px;
+                    cursor: pointer;
+                    font-size: 14px;
+                ">Clear Logs</button>
+                <span style="font-size: 12px; color: #666;">Live streaming enabled</span>
+            </div>
+        </div>
+        <div class="worker-logs-backdrop" style="
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.5);
+            z-index: 9999;
+        "></div>
+    `;
+    
+    $('body').append(modal_html);
+    
+    // Get logging handle and start streaming logs
+    try {
+        const handle = await puter.workers.getLoggingHandle(worker_name);
+        
+        const logHandler = (event) => {
+            // Remove waiting message on first log entry
+            $(`#${modal_id} .waiting-for-logs`).remove();
+            
+            const timestamp = new Date().toLocaleTimeString();
+            const formatted_content = format_log_entry(event.data);
+            const log_entry = `<div style="margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid #333; font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', monospace;">
+                <div style="color: #858585; font-size: 11px; margin-bottom: 4px;">[${timestamp}]</div>
+                ${formatted_content}
+            </div>`;
+            $(`#${modal_id} .log-entries`).append(log_entry);
+            
+            // Auto-scroll to bottom
+            const logsContent = $(`#${modal_id} .logs-content`)[0];
+            logsContent.scrollTop = logsContent.scrollHeight;
+        };
+        
+        handle.addEventListener("log", logHandler);
+        
+        // Store handle for cleanup
+        activeLogHandles[worker_name] = handle;
+        activeLogHandles[worker_name].logHandler = logHandler;
+        
+    } catch (err) {
+        $(`#${modal_id} .log-entries`).append(`<div style="color: #f44336; font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', monospace;">Error: ${html_encode(err.message)}</div>`);
+    }
+    
+    // Close modal handlers
+    $(document).on('click', `#${modal_id} .close-logs-modal, .worker-logs-backdrop`, function(e) {
+        if (e.target === this) {
+            // Clean up log handle
+            if (activeLogHandles[worker_name]) {
+                activeLogHandles[worker_name].removeEventListener("log", activeLogHandles[worker_name].logHandler);
+                activeLogHandles[worker_name] = null;
+            }
+            $(`#${modal_id}, .worker-logs-backdrop`).remove();
+        }
+    });
+    
+    // Clear logs handler
+    $(document).on('click', `#${modal_id} .clear-logs-btn`, function() {
+        $(`#${modal_id} .log-entries`).empty();
+        // Show waiting message again after clearing
+        $(`#${modal_id} .log-entries`).html(`
+            <div class="waiting-for-logs" style="
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                height: 100%;
+                min-height: 200px;
+                color: #858585;
+                font-style: italic;
+                font-size: 14px;
+            ">Waiting for logs...</div>
+        `);
+    });
+}
 
 async function attempt_worker_deletion(worker_name) {
     // confirm delete
