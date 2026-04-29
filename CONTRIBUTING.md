@@ -6,7 +6,7 @@ Welcome to Puter, the open-source distributed internet operating system. We're e
 
 # Report bugs
 
-Before reporting a bug, please check our [the issues on our GitHub repository](https://github.com/HeyPuter/puter/issues) to see if the bug has already been reported. If it has, you can add a comment to the existing issue with any additional information you have.
+Before reporting a bug, please check [the issues on our GitHub repository](https://github.com/HeyPuter/puter/issues) to see if the bug has already been reported. If it has, you can add a comment to the existing issue with any additional information you have.
 
 If you find a new bug in Puter, please [open an issue on our GitHub repository](https://github.com/HeyPuter/puter/issues/new). We'll do our best to address the issue as soon as possible. When reporting a bug, please include as much information as possible, including:
 
@@ -45,37 +45,14 @@ If you'd like to contribute code to Puter, you need to fork the project and subm
 
 We'll review your pull request and work with you to get your changes merged into the project.
 
-## Your first code contribution
-
-We maintain a list of issues that are good for first-time contributors. You can find these issues by searching for the [`good first issue`](https://github.com/HeyPuter/puter/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) label in our [GitHub repository](https://github.com/HeyPuter/puter). These issues are designed to be relatively easy to fix, and we're happy to help you get started. Pick an issue that interests you, and leave a comment on the issue to let us know you're working on it.
-
 <br>
 
-## Documentation for Contributors
+## PR Standards
 
-See [doc/contributors/index.md](./doc/contributors/index.md) for more information.
-
-<br>
-
-## Commit Messages
-
-Use the imperative, as is the convention in the Linux kernel:
-
-- correct: `Improve performance of readdir`
-- incorrect: `Improved readdir`
-- incorrect: `Improving readdir`
-
-We have the following exceptions to this rule:
-- If the commit message is in _past tense_, it's a shorthand for the following:
-  - `Apply changes that would be applied after one had <past tense message>`
-- If the commit message is in _present tense_, it's shorthand for the following:
-  - `Apply changes that would be applied after <present-tense message>`
-
-For example, the following are correct:
-- `Improved readdir`
-  - interpret this as: `Apply changes that would be applied after one had improved readdir`
-- `Improving readdir`
-  - interpret this as: `Apply changes that would be applied after improving readdir`
+We expect the following from pull requests (it makes things easier):
+- If you're closing an issue, please reference that issue in the PR description
+- Avoid whitespace changes
+- No regressions for "appspace" (Puter apps)
 
 <br>
 

@@ -1,0 +1,11 @@
+{
+    "unlimitedUsage": false,
+    "unlimitedAllowList": [
+        "admin"
+    ],
+    "allowedGlobalUsageUsers": [
+        "nj",
+        "salazareos"
+    ],
+    "priority": 10
+}

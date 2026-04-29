@@ -1,5 +1,5 @@
-/**
- * Copyright (C) 2024 Puter Technologies Inc.
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
  *
  * This file is part of Puter.
  *
@@ -16,7 +16,7 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-import translations from '../src/i18n/translations/translations.js';
+import translations from '../src/gui/src/i18n/translations/translations.js';
 import fs from 'fs';
 
 let hadError = false;
@@ -25,9 +25,15 @@ function reportError(message) {
     process.stderr.write(`❌ ${message}\n`);
 }
 
-// Check that each translation file is recorded in `translations`
+/**
+* Verifies that all translation files in the translations directory are properly registered
+* in the translations object. Checks for required properties like name, code, and dictionary.
+* Reports errors if translations are missing, improperly configured, or have mismatched codes.
+* @async
+* @returns {Promise<void>}
+*/
 async function checkTranslationRegistrations() {
-    const files = await fs.promises.readdir('./src/i18n/translations');
+    const files = await fs.promises.readdir('./src/gui/src/i18n/translations');
     for (const fileName of files) {
         if (!fileName.endsWith('.js')) continue;
         const translationName = fileName.substring(0, fileName.length - 3);
@@ -53,7 +59,13 @@ async function checkTranslationRegistrations() {
     }
 }
 
-// Ensure that translations only contain keys that exist in the en dictionary
+/**
+* Validates that translation dictionaries only contain keys present in en.js
+* 
+* Iterates through all translations (except English) and checks that each key in their
+* dictionary exists in the en.js dictionary. Reports errors for any keys that don't exist.
+* Skips validation if the translation dictionary is missing or invalid.
+*/
 function checkTranslationKeys() {
     const enDictionary = translations.en.dictionary;
 
@@ -72,13 +84,21 @@ function checkTranslationKeys() {
     }
 }
 
-// Ensure that all keys passed to i18n() exist in the en dictionary
+/**
+* Checks for usage of i18n() calls in source files and verifies that all translation keys exist in en.js
+* 
+* Scans JavaScript files in specified source directories for i18n() function calls using regex.
+* Validates that each key used in these calls exists in the English translation dictionary.
+* 
+* @async
+* @returns {Promise<void>}
+*/
 async function checkTranslationUsage() {
     const enDictionary = translations.en.dictionary;
 
     const sourceDirectories = [
-        './src/helpers',
-        './src/UI',
+        './src/gui/src/helpers',
+        './src/gui/src/UI',
     ];
 
     // Looks for i18n() calls using either ' or " for the key string.

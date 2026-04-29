@@ -1,0 +1,13 @@
+#!/usr/bin/env sh
+
+tmpfile="$(mktemp)"
+git diff --cached --name-only -z --diff-filter=ACMR -- \
+  '*.js' '*.mjs' '*.cjs' '*.jsx' '*.ts' '*.tsx' '*.vue' \
+  > "$tmpfile"
+
+if [ -s "$tmpfile" ]; then
+  xargs -0 eslint --fix < "$tmpfile" || true
+  xargs -0 git add < "$tmpfile"
+fi
+
+rm -f "$tmpfile"
