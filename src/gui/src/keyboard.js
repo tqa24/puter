@@ -26,16 +26,6 @@ import determine_active_container_parent from './helpers/determine_active_contai
 $(document).bind('keydown', async function (e) {
     const focused_el = document.activeElement;
     //-----------------------------------------------------------------------------
-    // Keyboard Shortcuts help
-    // F1 or Ctrl/Cmd + ? (Ctrl/Cmd + Shift + /)
-    //-----------------------------------------------------------------------------
-    if ( e.which === 112 || ((e.ctrlKey || e.metaKey) && e.shiftKey && e.which === 191) ) {
-        e.preventDefault();
-        e.stopPropagation();
-        window.open('/dashboard', '_blank');
-        return false;
-    }
-    //-----------------------------------------------------------------------------
     // Search
     // ctrl/command + f, will open UIWindowSearch
     //-----------------------------------------------------------------------------
