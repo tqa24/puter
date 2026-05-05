@@ -40,7 +40,7 @@ cd puter
 npm install
 npm start
 ```
-**→** This should launch Puter at  http://puter.localhost:4100 (or the next available port).
+**→** This should launch Puter at  http://puter.localhost:4100
 
 
 <br/>
@@ -58,8 +58,6 @@ curl -fsSL https://puter.com/selfhost | sh
 ```powershell
 irm https://puter.com/selfhost?os=windows | iex
 ```
-
-<br/>
 
 **→** For more details, see [Self-Hosting Puter](./doc/self-hosting.md).
 
