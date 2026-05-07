@@ -3206,7 +3206,7 @@ body {
 .dashboard-settings-card .button {
     flex-shrink: 0;
     color: var(--dashboard-text);
-    background: linear-gradient(var(--dashboard-sidebar-background), var(--dashboard-border));
+    background: var(--dashboard-button-background);
 }
 
 .dashboard-settings-card-success {
