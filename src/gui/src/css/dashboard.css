@@ -231,6 +231,19 @@ body {
     transition: opacity 0.15s ease;
 }
 
+.dashboard-sidebar-logo .dashboard-sidebar-logo-dark {
+    display: none;
+}
+
+@media (prefers-color-scheme: dark) {
+    .dashboard-sidebar-logo .dashboard-sidebar-logo-light {
+        display: none;
+    }
+    .dashboard-sidebar-logo .dashboard-sidebar-logo-dark {
+        display: inline;
+    }
+}
+
 .dashboard-sidebar-collapse-toggle {
     display: flex;
     align-items: center;
