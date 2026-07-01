@@ -1,101 +1,50 @@
-# Contributing to Puter
+# Contributing to Puter Backend
 
-Welcome to Puter, the open-source distributed internet operating system. We're excited to have you contribute to our project, whether you're reporting bugs, suggesting new features, or contributing code. This guide will help you get started with contributing to Puter in different ways.
+Thanks for contributing. These rules aren't strictly enforced — but following them makes every PR easier. If anything's unclear, ping a core maintainer or open the PR and ask.
 
-<br>
+New to the backend? Start with [doc/architecture.md](doc/architecture.md).
 
-# Report bugs
+---
 
-Before reporting a bug, please check our [the issues on our GitHub repository](https://github.com/HeyPuter/puter/issues) to see if the bug has already been reported. If it has, you can add a comment to the existing issue with any additional information you have.
+## 1. Test it. Run it.
 
-If you find a new bug in Puter, please [open an issue on our GitHub repository](https://github.com/HeyPuter/puter/issues/new). We'll do our best to address the issue as soon as possible. When reporting a bug, please include as much information as possible, including:
+Run the affected code path end-to-end before opening a PR. "It builds" is not "it works."
 
-- A clear and descriptive title
-- A description of the issue
-- Steps to reproduce the bug
-- Expected behavior
-- Actual behavior
-- Screenshots, if applicable
-- Your host operating system and browser
-- Your Puter version, location, ...
+Add tests for new behavior, endpoints, or bug fixes. If something's genuinely hard to test, say so in the PR.
 
-Please open a separate issue for each bug you find.
+## 2. Follow existing patterns
 
-Maintainers will apply the appropriate labels to your issue.
+Match the shape of similar code already in the repo. [doc/architecture.md](doc/architecture.md) is the source of truth for layers, wiring, and naming. If you think a pattern is wrong, raise it — don't quietly diverge.
 
-<br>
+## 3. Don't expose system or user information
 
-# Suggest new features
+Scan your diff for stray logs, debug routes, internal paths, secrets, tokens, or user data in errors/responses. When in doubt, return less. Flag any auth, permission, or data-export changes in the PR description.
 
-If you have an idea for a new feature in Puter, please open a new discussion thread on our [GitHub repository](https://github.com/HeyPuter/puter/discussions) to discuss your idea with the community. We'll do our best to respond to your suggestion as soon as possible.
+For private security reports, see [SECURITY.md](SECURITY.md).
 
-When suggesting a new feature, please include as much information as possible, including:
+## 4. AI-assisted code is fine — understood code is required
 
-- A clear and descriptive title
-- A description of the feature
-- The problem the feature will solve
-- Any relevant screenshots or mockups
-- Any relevant links or resources
+Don't commit code you couldn't have written, debugged, or defended yourself. Read the diff, run it, and be ready to explain it in review.
 
-<br>
+## 5. Update docs for API changes
 
-# Contribute code
+If you change puter-js APIs (drivers or endpoints used by puter-js), update [developer docs](src/docs/). puter-js itself may also need updating.
 
-If you'd like to contribute code to Puter, you need to fork the project and submit a pull request. If this is your first time contributing to an open-source project, we recommend reading this short guide by GitHub on [how to contribute to a project](https://docs.github.com/en/get-started/exploring-projects-on-github/contributing-to-a-project).
+## 6. Boy Scout Rule — leave it 1% better
 
-We'll review your pull request and work with you to get your changes merged into the project.
+![Boy Scout Rule](https://imgs.search.brave.com/DMmIWl5-NuZVtrR9kXBb06AKF8kturkgSW9UMb2-6m4/rs:fit:860:0:0:0/g:ce/aHR0cHM6Ly9sYXdz/b2Zzb2Z0d2FyZWVu/Z2luZWVyaW5nLmNv/bS9pbWFnZXMvbGF3/cy9ib3ktc2NvdXQt/cnVsZS5wbmc)
 
-## Your first code contribution
+Fix the typo, the dead import, the missing test, the bit you had to read twice. Keep cleanup proportional to the change — no refactors riding along on bug fixes.
 
-We maintain a list of issues that are good for first-time contributors. You can find these issues by searching for the [`good first issue`](https://github.com/HeyPuter/puter/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) label in our [GitHub repository](https://github.com/HeyPuter/puter). These issues are designed to be relatively easy to fix, and we're happy to help you get started. Pick an issue that interests you, and leave a comment on the issue to let us know you're working on it.
+---
 
-<br>
+## Opening a PR
 
-## Documentation for Contributors
+- One thing per PR where possible.
+- Describe **what** and **why**; the diff shows how.
+- Mention how you tested user-visible changes.
+- Drafts welcome.
 
-See [doc/contributors/index.md](./doc/contributors/index.md) for more information.
+---
 
-<br>
-
-## Commit Messages
-
-Use the imperative, as is the convention in the Linux kernel:
-
-- correct: `Improve performance of readdir`
-- incorrect: `Improved readdir`
-- incorrect: `Improving readdir`
-
-We have the following exceptions to this rule:
-- If the commit message is in _past tense_, it's a shorthand for the following:
-  - `Apply changes that would be applied after one had <past tense message>`
-- If the commit message is in _present tense_, it's shorthand for the following:
-  - `Apply changes that would be applied after <present-tense message>`
-
-For example, the following are correct:
-- `Improved readdir`
-  - interpret this as: `Apply changes that would be applied after one had improved readdir`
-- `Improving readdir`
-  - interpret this as: `Apply changes that would be applied after improving readdir`
-
-<br>
-
-## Code Review
-
-Once you've submitted your pull request, the project maintainers will review your changes. We may suggest some changes or improvements. This is a normal part of the process, and your contributions are greatly appreciated!
-
-<br>
-
-## Contribution License Agreement (CLA)
-
-Like many open source projects, we require contributors to sign a Contribution License Agreement (CLA) before we can accept your code. When you open a pull request for the first time, a bot will automatically add a comment with a link to the CLA. You can sign the CLA electronically by following the link and filling out the form.
-
-<br>
-
-# Getting Help
-
-If you have any questions about Puter, please feel free to reach out to us through the following channels:
-
-- [Discord](https://discord.com/invite/PQcx7Teh8u)
-- [Reddit](https://www.reddit.com/r/Puter/)
-- [Twitter](https://twitter.com/HeyPuter)
-- [Email](mailto:support@puter.com)
+Questions? Message a core maintainer. Welcome aboard.
