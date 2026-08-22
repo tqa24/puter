@@ -1,0 +1,865 @@
+/*
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import crypto from 'node:crypto';
+import type { Request, Response } from 'express';
+import { HttpError } from '../../core/http/HttpError.js';
+import type { PuterRouter } from '../../core/http/PuterRouter.js';
+import { PuterController } from '../types.js';
+import { sessionCookieFlags } from '../../util/cookieFlags.js';
+
+const REVALIDATION_COOKIE_NAME = 'puter_revalidation';
+const REVALIDATION_EXPIRY_SEC = 300;
+
+// Companion cookie that binds an OIDC flow to the browser that started it.
+// Expiry mirrors STATE_EXPIRY_SEC in OIDCService — the state and its
+// browser-binding cookie must expire together.
+const OIDC_NONCE_COOKIE_NAME = 'puter_oidc_nonce';
+const OIDC_NONCE_EXPIRY_SEC = 600;
+
+const OIDC_ERROR_REDIRECT_MAP: Record<string, Record<string, string>> = {
+    login: { account_not_found: 'signup', other: 'login' },
+    signup: { account_already_exists: 'login', other: 'signup' },
+};
+
+// The `message` query param is clamped to these codes — the GUI maps them to
+// display text. Free-text errors (which may describe internals or, for vetoed
+// signups, the block reason) never reach the redirect URL.
+const ALLOWED_ERRORS = [
+    'account_suspended',
+    'unauthorized',
+    'signup_blocked',
+] as const;
+
+/**
+ * Pick the display code for a failed user resolution.
+ *
+ * A `code` is only ever set when the signup-validate harness vetoed the signup,
+ * but the code it stamps comes from an abuse listener and is not drawn from
+ * {@link ALLOWED_ERRORS} — so clamping it directly turns every vetoed OIDC
+ * signup into a bare `unauthorized`, which reads as "sign-in broke" and hides
+ * both the real cause and the Request Code that support looks the decision up
+ * by. Anything unrecognized falls back to the veto's own category instead.
+ */
+function resolutionErrorCode(code: string | undefined): string {
+    if (!code) return 'unauthorized';
+    return (ALLOWED_ERRORS as readonly string[]).includes(code)
+        ? code
+        : 'signup_blocked';
+}
+
+// GUI pages an OIDC flow may return to: /desktop, /dashboard, and direct app
+// landings (/app/<name> and its desktop-booted twin /desktop/app/<name>,
+// mirroring APP_NAME_REGEX in AppDriver). Strict whitelist — never a
+// client-supplied URL (no open redirect).
+function isWhitelistedReturnPath(path: string): boolean {
+    return (
+        path === '/desktop' ||
+        path === '/dashboard' ||
+        /^(\/desktop)?\/app\/[a-zA-Z0-9_-]{1,100}$/.test(path)
+    );
+}
+
+function buildErrorRedirectUrl(
+    origin: string,
+    sourceFlow: string,
+    errorCondition: string,
+    message: string,
+    stateDecoded?: Record<string, unknown>,
+    requestCode?: string,
+    // Signs the popup-return proof. Passed in because this is a module-level
+    // helper with no access to services; omitted by callers that have no
+    // state to attest (the proof is simply absent then, and the popup falls
+    // back to its browser-attested sources).
+    signPopupReturn?: (payload: Record<string, unknown>) => string,
+): string {
+    const targetFlow =
+        OIDC_ERROR_REDIRECT_MAP[sourceFlow]?.[errorCondition] ?? sourceFlow;
+    const base = origin.replace(/\/$/, '') || '/';
+    const clamped = (ALLOWED_ERRORS as readonly string[]).includes(message)
+        ? message
+        : 'unauthorized';
+
+    // Land back on the whitelisted page the flow started from (e.g. an
+    // /app/<name> landing) so the retry — and the eventual success — keeps
+    // the user's destination. redirect_uri comes from the signed state and
+    // was built server-side, but re-check the path against the whitelist.
+    let pagePath = '/';
+    if (typeof stateDecoded?.redirect_uri === 'string') {
+        try {
+            const statePath = new URL(stateDecoded.redirect_uri).pathname;
+            if (isWhitelistedReturnPath(statePath)) pagePath = statePath;
+        } catch {
+            // unparsable redirect_uri: fall back to the root page
+        }
+    }
+
+    let params: URLSearchParams;
+    if (stateDecoded?.embedded_in_popup && stateDecoded?.msg_id != null) {
+        params = new URLSearchParams({
+            embedded_in_popup: 'true',
+            msg_id: String(stateDecoded.msg_id),
+            auth_error: '1',
+            message: clamped,
+            action: targetFlow,
+        });
+        if (stateDecoded?.opener_origin) {
+            params.set('opener_origin', String(stateDecoded.opener_origin));
+        }
+        // Same reasoning as the success leg: the popup cannot tell a verified
+        // `opener_origin` from a typed one, so attest it. The error leg is a
+        // real return from the provider too — the flow failed, not the hop.
+        if (signPopupReturn) {
+            params.set(
+                'opener_state',
+                signPopupReturn({
+                    opener_origin: stateDecoded?.opener_origin ?? null,
+                    msg_id: stateDecoded?.msg_id ?? null,
+                    oidc_login: false,
+                }),
+            );
+        }
+    } else {
+        params = new URLSearchParams({
+            action: targetFlow,
+            auth_error: '1',
+            message: clamped,
+        });
+    }
+    if (requestCode) {
+        params.set('request_code', requestCode);
+    }
+    return `${base}${pagePath}?${params.toString()}`;
+}
+
+function appendQueryParam(url: string, key: string, value: string): string {
+    const sep = url.includes('?') ? '&' : '?';
+    return `${url}${sep}${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
+}
+
+/** Length-safe constant-time string compare (never throws on mismatch). */
+function constantTimeEqual(a: string, b: string): boolean {
+    const ba = Buffer.from(a);
+    const bb = Buffer.from(b);
+    if (ba.length !== bb.length) return false;
+    return crypto.timingSafeEqual(ba, bb);
+}
+
+/**
+ * True iff `target` parses as a URL whose origin equals `origin`. Used to clamp
+ * OIDC redirect targets — `startsWith` would accept
+ * `https://puter.com.evil.com` against `https://puter.com`.
+ */
+function isSameOrigin(target: string, origin: string): boolean {
+    if (!origin) return true;
+    try {
+        return new URL(target).origin === new URL(origin).origin;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * OIDC controller — provider listing, auth start, callbacks for
+ * login/signup/revalidate, and revalidate-done landing page.
+ */
+export class OIDCController extends PuterController {
+    registerRoutes(router: PuterRouter): void {
+        // -- POST /auth/oidc/verify-popup-return ---------------------
+        // Public — hand back the facts a popup-return proof attests to.
+        //
+        // A sign-in popup returning from a provider is told the opener's
+        // origin and that a login completed. It cannot check either: the
+        // values arrive as query parameters, and a URL built from a verified
+        // `state` looks exactly like one an attacker typed. The opener's
+        // origin decides which app a token gets minted for, so the popup
+        // redeems the signed proof here instead of believing the raw
+        // parameters.
+        //
+        // Unauthenticated on purpose — it reveals nothing the caller did not
+        // already hand over, and a forged or expired proof yields nothing.
+
+        router.post(
+            '/auth/oidc/verify-popup-return',
+            {
+                subdomain: 'api',
+                rateLimit: {
+                    scope: 'oidc-verify-popup-return',
+                    limit: 60,
+                    window: 60_000,
+                },
+            },
+            async (req: Request, res: Response) => {
+                const proof = req.body?.opener_state;
+                if (typeof proof !== 'string' || !proof) {
+                    throw new HttpError(400, 'Missing `opener_state`', {
+                        legacyCode: 'bad_request',
+                    });
+                }
+                const decoded = this.services.oidc.verifyPopupReturn(proof);
+                if (!decoded) {
+                    throw new HttpError(400, 'Invalid `opener_state`', {
+                        legacyCode: 'bad_request',
+                    });
+                }
+                res.json({
+                    opener_origin: decoded.opener_origin ?? null,
+                    msg_id: decoded.msg_id ?? null,
+                    oidc_login: decoded.oidc_login === true,
+                });
+            },
+        );
+
+        // -- GET /auth/oidc/providers --------------------------------
+        // Public — list enabled provider IDs for the frontend.
+        //
+        // Every render of a login form reads this, and with no actor the
+        // bucket is the address: one corporate egress, campus or carrier
+        // gateway stands for every person behind it. Size it for that — a
+        // large shared address is thousands of people, and a shift or class
+        // change bunches their sign-ins into the same minute — but no
+        // further. This is login surface, so the ceiling should still bound
+        // someone enumerating which identity providers a deployment accepts.
+
+        router.get(
+            '/auth/oidc/providers',
+            {
+                subdomain: 'api',
+                rateLimit: {
+                    scope: 'oidc-providers',
+                    limit: 1_200,
+                    window: 60_000,
+                    key: 'ip',
+                },
+            },
+            async (_req: Request, res: Response) => {
+                const providers =
+                    await this.services.oidc.getEnabledProviderIds();
+                res.json({ providers });
+            },
+        );
+
+        // -- GET /auth/oidc/:provider/start --------------------------
+        // Redirect user to IdP authorization endpoint.
+
+        router.get(
+            '/auth/oidc/:provider/start',
+            {
+                subdomain: '',
+                rateLimit: { scope: 'oidc-general', limit: 30, window: 60_000 },
+            },
+            async (req: Request, res: Response) => {
+                const provider = String(req.params.provider);
+                const cfg =
+                    await this.services.oidc.getProviderConfig(provider);
+                if (!cfg)
+                    throw new HttpError(404, 'Provider not configured.', {
+                        legacyCode: 'not_found',
+                    });
+
+                const flow = String(
+                    Array.isArray(req.query.flow)
+                        ? req.query.flow[0]
+                        : (req.query.flow ?? 'login'),
+                );
+                const origin = (this.config.origin ?? '').replace(/\/$/, '');
+
+                const flowRedirects: Record<string, string> = {
+                    login: origin || '/',
+                    signup: origin || '/',
+                    revalidate: `${origin}/auth/revalidate-done`,
+                };
+
+                let appRedirectUri = flowRedirects[flow] ?? (origin || '/');
+
+                // Optional GUI return path so login started from /desktop,
+                // /dashboard, or an /app/<name> landing lands back there.
+                const rawReturnTo = Array.isArray(req.query.return_to)
+                    ? req.query.return_to[0]
+                    : req.query.return_to;
+                if (
+                    (flow === 'login' || flow === 'signup') &&
+                    typeof rawReturnTo === 'string' &&
+                    isWhitelistedReturnPath(rawReturnTo)
+                ) {
+                    appRedirectUri = `${origin}${rawReturnTo}`;
+                }
+
+                // Popup support
+                const rawPopup = Array.isArray(req.query.embedded_in_popup)
+                    ? req.query.embedded_in_popup[0]
+                    : req.query.embedded_in_popup;
+                const embeddedInPopup = rawPopup === 'true' || rawPopup === '1';
+                const rawMsgId = Array.isArray(req.query.msg_id)
+                    ? req.query.msg_id[0]
+                    : req.query.msg_id;
+                const msgId =
+                    rawMsgId != null && rawMsgId !== ''
+                        ? String(rawMsgId)
+                        : null;
+                const rawOpener = Array.isArray(req.query.opener_origin)
+                    ? req.query.opener_origin[0]
+                    : req.query.opener_origin;
+                const openerOrigin =
+                    rawOpener != null && rawOpener !== ''
+                        ? String(rawOpener)
+                        : null;
+
+                if (embeddedInPopup && msgId) {
+                    appRedirectUri = `${origin}/action/sign-in?embedded_in_popup=true&msg_id=${encodeURIComponent(msgId)}`;
+                    if (openerOrigin) {
+                        appRedirectUri += `&opener_origin=${encodeURIComponent(openerOrigin)}`;
+                    }
+                }
+
+                const rawReferrer = Array.isArray(req.query.referrer)
+                    ? req.query.referrer[0]
+                    : req.query.referrer;
+                const referrer =
+                    rawReferrer != null && rawReferrer !== ''
+                        ? String(rawReferrer)
+                        : null;
+
+                const statePayload: Record<string, unknown> = {
+                    provider,
+                    redirect_uri: appRedirectUri,
+                };
+                if (referrer) statePayload.referrer = referrer ?? openerOrigin;
+                if (embeddedInPopup && msgId) {
+                    statePayload.embedded_in_popup = true;
+                    statePayload.msg_id = msgId;
+                    if (openerOrigin) statePayload.opener_origin = openerOrigin;
+                }
+                if (flow === 'revalidate') {
+                    const rawUserUuid = Array.isArray(req.query.user_uuid)
+                        ? req.query.user_uuid[0]
+                        : req.query.user_uuid;
+                    if (typeof rawUserUuid !== 'string' || !rawUserUuid)
+                        throw new HttpError(
+                            400,
+                            'user_uuid required for revalidate flow.',
+                            { legacyCode: 'bad_request' },
+                        );
+                    statePayload.user_uuid = rawUserUuid;
+                    statePayload.flow = 'revalidate';
+                }
+
+                // Bind this flow to the initiating browser: a single-use
+                // nonce lives both in the signed `state` and in an HttpOnly
+                // companion cookie. The callback requires them to match, so a
+                // `state` captured from an attacker's own flow can't be
+                // replayed in a victim's browser (login-CSRF / session
+                // fixation).
+                const browserNonce = crypto
+                    .randomBytes(32)
+                    .toString('base64url');
+                statePayload.nonce = browserNonce;
+
+                const state = this.services.oidc.signState(statePayload);
+                const url = await this.services.oidc.getAuthorizationUrl(
+                    provider,
+                    state,
+                    flow,
+                );
+                if (!url)
+                    throw new HttpError(
+                        500,
+                        'Could not build authorization URL.',
+                        { legacyCode: 'internal_error' },
+                    );
+
+                res.cookie(OIDC_NONCE_COOKIE_NAME, browserNonce, {
+                    // Same flags as the session cookie: SameSite=None;Secure
+                    // on HTTPS so the cookie survives Apple's cross-site
+                    // form_post callback; Lax on plain-HTTP self-host.
+                    ...sessionCookieFlags(this.config),
+                    httpOnly: true,
+                    maxAge: OIDC_NONCE_EXPIRY_SEC * 1000,
+                    path: '/',
+                });
+                res.redirect(302, url);
+            },
+        );
+
+        // -- /auth/oidc/callback/login (GET + POST) ----------------
+
+        const cbOpts = {
+            subdomain: '',
+            rateLimit: { scope: 'oidc-general', limit: 30, window: 60_000 },
+        };
+
+        const loginCb = async (req: Request, res: Response) => {
+            const origin = this.config.origin ?? '';
+            const result = await this.#processCallback(req, res, 'login');
+            if ('error' in result) {
+                console.warn(`OIDC login callback error: ${result.error}`);
+                return res.redirect(
+                    302,
+                    buildErrorRedirectUrl(
+                        origin,
+                        'login',
+                        'other',
+                        result.error,
+                    ),
+                );
+            }
+
+            const { provider, userinfo, stateDecoded } = result;
+
+            const resolved = await this.#resolveOrCreateOIDCUser(
+                provider,
+                userinfo,
+                (stateDecoded.referrer as string) ?? null,
+            );
+            if ('error' in resolved) {
+                console.warn(
+                    `OIDC login user resolution error: ${resolved.error}`,
+                );
+                return res.redirect(
+                    302,
+                    buildErrorRedirectUrl(
+                        origin,
+                        'login',
+                        'other',
+                        resolutionErrorCode(resolved.code),
+                        stateDecoded,
+                        resolved.requestCode,
+                        (p) => this.services.oidc.signPopupReturn(p),
+                    ),
+                );
+            }
+            const user = resolved.user;
+
+            if (user.suspended) {
+                console.warn(
+                    `Suspended user tried to login via oidc: ${user.username}`,
+                );
+                return res.redirect(
+                    302,
+                    buildErrorRedirectUrl(
+                        origin,
+                        'login',
+                        'other',
+                        'account_suspended',
+                        stateDecoded,
+                        undefined,
+                        (p) => this.services.oidc.signPopupReturn(p),
+                    ),
+                );
+            }
+
+            await this.#finishLogin(res, user, stateDecoded);
+        };
+        router.get('/auth/oidc/callback/login', cbOpts, loginCb);
+        router.post('/auth/oidc/callback/login', cbOpts, loginCb);
+
+        // -- /auth/oidc/callback/signup (GET + POST) ----------------
+
+        const signupCb = async (req: Request, res: Response) => {
+            const origin = this.config.origin ?? '';
+            const result = await this.#processCallback(req, res, 'signup');
+            if ('error' in result) {
+                console.warn(`OIDC signup callback error: ${result.error}`);
+                return res.redirect(
+                    302,
+                    buildErrorRedirectUrl(
+                        origin,
+                        'signup',
+                        'other',
+                        'unauthorized',
+                    ),
+                );
+            }
+
+            const { provider, userinfo, stateDecoded } = result;
+
+            const resolved = await this.#resolveOrCreateOIDCUser(
+                provider,
+                userinfo,
+                (stateDecoded.referrer as string) ?? null,
+            );
+            if ('error' in resolved) {
+                console.warn(
+                    `OIDC signup user resolution error: ${resolved.error}`,
+                );
+                return res.redirect(
+                    302,
+                    buildErrorRedirectUrl(
+                        origin,
+                        'signup',
+                        'other',
+                        resolutionErrorCode(resolved.code),
+                        stateDecoded,
+                        resolved.requestCode,
+                        (p) => this.services.oidc.signPopupReturn(p),
+                    ),
+                );
+            }
+            const user = resolved.user;
+
+            if (user.suspended) {
+                return res.redirect(
+                    302,
+                    buildErrorRedirectUrl(
+                        origin,
+                        'signup',
+                        'other',
+                        'account_suspended',
+                        stateDecoded,
+                        undefined,
+                        (p) => this.services.oidc.signPopupReturn(p),
+                    ),
+                );
+            }
+
+            // If we landed on an existing account (either via the
+            // provider_sub or via email match), signal the GUI so it can
+            // render a "signed in" flow rather than "account created".
+            const extra =
+                resolved.origin === 'created'
+                    ? undefined
+                    : { oidc_switched: 'login' };
+            await this.#finishLogin(res, user, stateDecoded, extra);
+        };
+        router.get('/auth/oidc/callback/signup', cbOpts, signupCb);
+        router.post('/auth/oidc/callback/signup', cbOpts, signupCb);
+
+        // -- /auth/oidc/callback/revalidate (GET + POST) ------------
+
+        const revalidateCb = async (
+            req: Request,
+            res: Response,
+        ): Promise<void> => {
+            const result = await this.#processCallback(req, res, 'revalidate');
+            if ('error' in result) {
+                res.status(400).send(result.error);
+                return;
+            }
+
+            const { provider, userinfo, stateDecoded } = result;
+            if (
+                stateDecoded.flow !== 'revalidate' ||
+                typeof stateDecoded.user_uuid !== 'string' ||
+                stateDecoded.user_uuid.length === 0
+            ) {
+                res.status(400).send('Invalid revalidate state.');
+                return;
+            }
+
+            const user = await this.services.oidc.findUserByProviderSub(
+                provider,
+                userinfo.sub,
+            );
+            if (!user) {
+                res.status(400).send('No account found.');
+                return;
+            }
+            if (user.uuid !== stateDecoded.user_uuid) {
+                res.status(403).send(
+                    'Wrong account. Sign in with the account linked to this session.',
+                );
+                return;
+            }
+
+            const token = this.services.oidc.signRevalidation(user.uuid);
+            res.cookie(REVALIDATION_COOKIE_NAME, token, {
+                // Revalidation flow is same-site only — `lax` even on HTTPS.
+                ...sessionCookieFlags(this.config, { crossSite: false }),
+                httpOnly: true,
+                maxAge: REVALIDATION_EXPIRY_SEC * 1000,
+                path: '/',
+            });
+
+            const origin = (this.config.origin ?? '').replace(/\/$/, '');
+            const requested =
+                (stateDecoded.redirect_uri as string) ||
+                `${origin}/auth/revalidate-done`;
+            const target = isSameOrigin(requested, origin)
+                ? requested
+                : `${origin}/auth/revalidate-done`;
+            res.redirect(302, target);
+        };
+        router.get('/auth/oidc/callback/revalidate', cbOpts, revalidateCb);
+        router.post('/auth/oidc/callback/revalidate', cbOpts, revalidateCb);
+
+        // -- GET /auth/revalidate-done -------------------------------
+        // Landing page after revalidation; posts to opener for popup flow.
+        //
+        // Deliberately not on the `oidc-general` bucket the start/callback
+        // routes share: those exchange codes with an identity provider, this
+        // one is a constant HTML page that touches nothing. Sharing a bucket
+        // meant everyone reachable through one address — an office, a school,
+        // a carrier gateway — competed for the same 30 popup closes a minute.
+        // The replacement is sized for the humans behind one such address
+        // re-validating at once, not for a fleet: it is still auth surface,
+        // and one page view per revalidation is a low-volume event.
+
+        router.get(
+            '/auth/revalidate-done',
+            {
+                subdomain: '',
+                rateLimit: {
+                    scope: 'oidc-revalidate-done',
+                    limit: 600,
+                    window: 60_000,
+                },
+            },
+            (_req: Request, res: Response) => {
+                const origin = this.config.origin ?? '';
+                res.set('Content-Type', 'text/html; charset=utf-8');
+                res.send(`<!DOCTYPE html><html><head><title>Re-validated</title></head><body><script>
+(function(){
+var origin = ${JSON.stringify(origin)};
+if (window.opener) {
+  try { window.opener.postMessage({ type: 'puter-revalidate-done' }, origin); } catch (e) {}
+  window.close();
+} else {
+  document.body.innerHTML = '<p>Re-validated. You can close this tab.</p>';
+}
+})();
+</script><p>Re-validated. Closing&hellip;</p></body></html>`);
+            },
+        );
+    }
+
+    // -- Shared helpers ----------------------------------------------
+
+    /**
+     * Resolve an OIDC callback to a Puter user. In order:
+     *
+     * 1. Existing link on (provider, sub) → that user.
+     * 2. Email matches an existing account whose email is CONFIRMED → link
+     *    (provider, sub) to that user.
+     * 3. Email matches an account whose email is UNCONFIRMED → refuse. We don't
+     *    know who owns an unconfirmed address, so linking would let whoever
+     *    controls the OIDC identity hijack a pending signup.
+     * 4. Otherwise create a new user and link.
+     *
+     * Step 2 also requires `email_verified !== false` on the OIDC side,
+     * otherwise a malicious IdP could claim someone else's email.
+     *
+     * The email-match path does NOT touch the existing user's password, so
+     * password login keeps working.
+     */
+    async #resolveOrCreateOIDCUser(
+        provider: string,
+        userinfo: { sub: string; email?: unknown; [k: string]: unknown },
+        referrer?: string | null,
+        attempt = 0,
+    ): Promise<
+        | { error: string; code?: string; requestCode?: string }
+        | {
+              user: import('../../stores/user/UserStore.js').UserRow;
+              origin: 'linked-sub' | 'linked-email' | 'created';
+          }
+    > {
+        // 1. Existing provider/sub link.
+        const linked = await this.services.oidc.findUserByProviderSub(
+            provider,
+            userinfo.sub,
+        );
+        if (linked) return { user: linked, origin: 'linked-sub' };
+
+        // 2/3. Email match branch.
+        const claimedEmail =
+            typeof userinfo.email === 'string' ? userinfo.email : null;
+        if (claimedEmail) {
+            // On the retry after a lost race, read the primary — the winning
+            // row may be younger than the replica snapshot.
+            const byEmail = await this.services.oidc.findUserByEmail(
+                claimedEmail,
+                { force: attempt > 0 },
+            );
+            if (byEmail) {
+                if (!byEmail.email_confirmed) {
+                    return {
+                        error: 'An account with this email exists but the email is not yet confirmed. Please sign in with your password to confirm it first.',
+                    };
+                }
+                const outcome = await this.services.oidc.linkProviderToUser(
+                    byEmail.id,
+                    provider,
+                    userinfo as { sub: string; email?: string },
+                );
+                if (!outcome.success) {
+                    return {
+                        error: outcome.error ?? 'Failed to link provider.',
+                    };
+                }
+                return { user: byEmail, origin: 'linked-email' };
+            }
+        }
+
+        // 3. Fresh account.
+        const outcome = await this.services.oidc.createUserFromOIDC(
+            provider,
+            userinfo as { sub: string; email?: string },
+            referrer,
+        );
+        // A concurrent callback (a second tab, a provider retry) created the
+        // account between step 2 and the insert. Nothing went wrong for the
+        // user — start over and we'll find the winner at step 1 or 2. One retry
+        // only: a second miss means something other than a race is going on.
+        if (outcome.raced && attempt === 0) {
+            return this.#resolveOrCreateOIDCUser(
+                provider,
+                userinfo,
+                referrer,
+                attempt + 1,
+            );
+        }
+        if (!outcome.success || !outcome.user) {
+            return {
+                error: outcome.error ?? 'Account creation failed.',
+                code: outcome.code,
+                requestCode: outcome.requestCode,
+            };
+        }
+        return { user: outcome.user, origin: 'created' };
+    }
+
+    async #processCallback(
+        req: Request,
+        res: Response,
+        flow: string,
+    ): Promise<
+        | { error: string }
+        | {
+              provider: string;
+              userinfo: { sub: string; [k: string]: unknown };
+              stateDecoded: Record<string, unknown>;
+          }
+    > {
+        // Apple uses response_mode=form_post, so params arrive in the body.
+        const src = req.method === 'POST' && req.body ? req.body : req.query;
+        const code = String(
+            Array.isArray(src.code) ? src.code[0] : (src.code ?? ''),
+        );
+        const state = String(
+            Array.isArray(src.state) ? src.state[0] : (src.state ?? ''),
+        );
+        if (!code || !state) return { error: 'Missing code or state.' };
+
+        const stateDecoded = this.services.oidc.verifyState(state);
+        if (!stateDecoded || !stateDecoded.provider)
+            return { error: 'Invalid or expired state.' };
+
+        // Enforce the browser binding set at /start. Every state minted by
+        // the current /start carries a nonce, so this covers all live flows.
+        // States signed before this shipped have no nonce and pass through
+        // until they expire (STATE_EXPIRY, 10 min) so in-flight logins don't
+        // break on deploy — a caller can't forge a nonce-less state because
+        // /start always adds one and the state is server-signed.
+        const expectedNonce =
+            typeof stateDecoded.nonce === 'string' ? stateDecoded.nonce : '';
+        if (expectedNonce) {
+            const cookieNonce = req.cookies?.[OIDC_NONCE_COOKIE_NAME];
+            // Single-use: drop the cookie regardless of the outcome.
+            res.clearCookie(OIDC_NONCE_COOKIE_NAME, { path: '/' });
+            if (
+                typeof cookieNonce !== 'string' ||
+                !constantTimeEqual(cookieNonce, expectedNonce)
+            ) {
+                return {
+                    error: 'This sign-in could not be verified for your browser. Please start again.',
+                };
+            }
+        }
+
+        const provider = String(stateDecoded.provider);
+        const callbackUrl = this.services.oidc.getCallbackUrl(flow);
+        if (!callbackUrl) return { error: 'Invalid flow.' };
+
+        const tokens = await this.services.oidc.exchangeCodeForTokens(
+            provider,
+            code,
+            callbackUrl,
+        );
+        if (!tokens || !tokens.access_token)
+            return { error: 'Token exchange failed.' };
+
+        const userinfo = await this.services.oidc.getUserInfo(
+            provider,
+            tokens.access_token,
+            typeof tokens.id_token === 'string' ? tokens.id_token : undefined,
+        );
+        if (!userinfo || !userinfo.sub)
+            return { error: 'Could not get user info.' };
+
+        return { provider, userinfo, stateDecoded };
+    }
+
+    async #finishLogin(
+        res: Response,
+        user: {
+            id: number;
+            uuid: string;
+            username: string;
+            email?: string | null;
+            [k: string]: unknown;
+        },
+        stateDecoded: Record<string, unknown>,
+        extraQueryParams?: Record<string, string>,
+    ): Promise<void> {
+        const { token: sessionToken } =
+            await this.services.auth.createSessionToken(
+                user as import('../../stores/user/UserStore.js').UserRow,
+            );
+
+        const cookieName = this.config.cookie_name ?? 'puter_token';
+        res.cookie(cookieName, sessionToken, {
+            ...sessionCookieFlags(this.config),
+            httpOnly: true,
+        });
+
+        const origin = (this.config.origin ?? '').replace(/\/$/, '');
+        let target = (stateDecoded.redirect_uri as string) || origin || '/';
+        if (!isSameOrigin(target, origin)) {
+            target = origin || '/';
+        }
+
+        if (stateDecoded.embedded_in_popup) {
+            target = appendQueryParam(target, 'oidc_login', 'true');
+            // `opener_origin` and `oidc_login` reach the popup as bare query
+            // parameters, which say nothing about where they came from: the
+            // URL a verified state produces is byte-identical to one anybody
+            // can type. The popup treats the opener's origin as the app
+            // identity to mint a token for, so it needs the integrity this
+            // state already carries — re-signed here, at the one point where
+            // the round trip is known to have actually happened.
+            target = appendQueryParam(
+                target,
+                'opener_state',
+                this.services.oidc.signPopupReturn({
+                    opener_origin: stateDecoded.opener_origin ?? null,
+                    msg_id: stateDecoded.msg_id ?? null,
+                    oidc_login: true,
+                }),
+            );
+        }
+
+        if (extraQueryParams) {
+            for (const [k, v] of Object.entries(extraQueryParams)) {
+                if (v != null) target = appendQueryParam(target, k, v);
+            }
+        }
+
+        res.redirect(302, target);
+    }
+}

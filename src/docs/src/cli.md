@@ -1,0 +1,240 @@
+---
+title: CLI
+description: Manage your Puter resources directly from your terminal with the Puter CLI. Deploy static sites and serverless workers without leaving your shell.
+---
+
+The [Puter CLI](https://www.npmjs.com/package/@heyputer/cli) lets you manage your Puter resources straight from the terminal: deploy static websites, ship serverless workers, inspect the apps registered to your account, and explore the key-value stores behind your apps and workers, all without leaving your shell.
+
+<div class="info">The Puter CLI is in beta (0.x). Behavior may change between releases.</div>
+
+## Installation
+
+Install the CLI globally with npm (requires Node 18+):
+
+```sh
+npm install -g @heyputer/cli
+```
+
+Then log in once and your token is stored for later commands:
+
+```sh
+puter login
+```
+
+This opens your browser to authenticate with Puter. Once you're logged in, you're ready to deploy.
+
+## Authentication
+
+`puter login` runs an interactive browser flow and saves your token for future commands. If you don't have browser access (for example, on a remote server), pipe a token in via stdin instead:
+
+```sh
+echo "$TOKEN" | puter login --with-token
+```
+
+For automation and CI, set the `PUTER_AUTH_TOKEN` environment variable and the CLI skips login entirely, reading the token from the environment on every command.
+
+```sh
+puter whoami     # show the current account
+puter logout     # clear the stored token
+```
+
+## Sites
+
+Deploy a static directory to a `<subdomain>.puter.site` address, then list, inspect, or remove your sites.
+
+```sh
+puter site deploy ./dist my-app
+```
+
+Run `puter site deploy` with no arguments and the CLI prompts you for the directory and subdomain interactively, suggesting an available name. Deploys are versioned: each deploy uploads into its own folder, so previous versions are preserved.
+
+```sh
+puter site deploy [dir] [subdomain]   # deploy a directory
+puter site list                       # list your sites
+puter site get <subdomain>            # show one site's details
+puter site delete <subdomain>         # remove a site
+```
+
+## Workers
+
+Deploy a single JavaScript file as a serverless [Worker](/Workers/), served at `<name>.puter.work`. Deploying with a name that already exists replaces that worker's code in place.
+
+```sh
+puter worker deploy ./api.js my-api
+```
+
+As with sites, running `puter worker deploy` with no arguments prompts you for the file and name.
+
+```sh
+puter worker deploy [file] [name]   # deploy or replace a worker
+puter worker list                   # list your workers
+puter worker get <name>             # show one worker's details
+puter worker delete <name>          # delete a worker
+```
+
+## Apps
+
+Browse the apps registered to your account. These commands are read-only.
+
+```sh
+puter app list           # list your apps
+puter app get <name>     # show one app's details
+```
+
+## Key-value store
+
+Open an interactive JavaScript shell against the [key-value store](/KV/) of one app or [worker](/Workers/), so you can read and edit its data directly instead of going through the app. Pass an app name, a worker name or its `*.puter.work` URL, or a uid:
+
+```sh
+puter kv connect my-app
+```
+
+The CLI resolves the app, checks the store is reachable, and drops you at a prompt:
+
+```console
+$ puter kv connect notes
+✔ Connected to notes (app-1f2e3d4c…) · 12 keys
+kv(notes)> set("greeting", "hi")
+true
+kv(notes)> get("greeting")
+'hi'
+kv(notes)> list("gre", true)
+[ { key: 'greeting', value: 'hi' } ]
+```
+
+A worker connects the same way. Deploying a worker from your account gives it its own sandbox app, and that app's store is where the worker's `puter.kv` data lives — so naming the worker connects you to it, and the prompt says which one you're in:
+
+```console
+$ puter kv connect my-api
+✔ Connected to worker my-api (app-9a8b7c6d…) · 3 keys
+kv(worker:my-api)> list()
+[ 'visits' ]
+```
+
+Names are looked up as apps first, so if an app and a worker share a name you get the app; pass the worker's URL (`puter kv connect https://my-api.puter.work`) to ask for the worker instead. A worker deployed by an app rather than by you has no store of its own — connect to the app that owns it.
+
+Every [`puter.kv`](/KV/) method is bound to the connected app and available bare, as `kv.set(…)`, and as `puter.kv.set(…)`, so examples copied from these docs run as written. Results are awaited for you — `get("k")` prints the value rather than a pending promise — and `_` holds the last result.
+
+It's a full JavaScript REPL, so multi-line input, variables, and history between sessions all work. `.help` lists the kv methods, `.clear` resets the session, and `.exit` (or Ctrl-D) quits.
+
+<div class="info">Writes through <code>puter kv connect</code> go to the connected app's store, not your user-level store — the same data the app or worker itself reads and writes.</div>
+
+## CLI reference
+
+### Global options
+
+| Option | Description |
+| --- | --- |
+| `-v`, `--version` | Print the CLI version. |
+| `-h`, `--help` | Show help for any command, e.g. `puter site deploy --help`. |
+
+The CLI detects whether it's running interactively. In a terminal it prompts for any missing values; in a non-interactive context (CI, piped output, or with `CI` set) it never prompts, so required arguments must be passed explicitly.
+
+### `puter login`
+
+Log in to Puter and store the token for later commands.
+
+| Argument / Option | Description |
+| --- | --- |
+| `--with-token` | Read an auth token from stdin instead of opening a browser. |
+
+### `puter logout`
+
+Clear the stored auth token. Takes no arguments.
+
+### `puter whoami`
+
+Show the account associated with the current token. Takes no arguments.
+
+### `puter site deploy`
+
+Deploy a static directory to `<subdomain>.puter.site`.
+
+| Argument | Description |
+| --- | --- |
+| `[dir]` | Directory to deploy. Prompted for when omitted interactively. |
+| `[subdomain]` | Target subdomain. Prompted for when omitted interactively; a pasted full host like `my-app.puter.site` is accepted. |
+
+In non-interactive mode both arguments are required. Subdomains may use lowercase letters, numbers, and hyphens (not at the ends).
+
+### `puter site list`
+
+List the subdomains you own, with their URLs. Takes no arguments.
+
+### `puter site get`
+
+Show details for one site.
+
+| Argument | Description |
+| --- | --- |
+| `<subdomain>` | The subdomain to inspect. |
+
+### `puter site delete`
+
+Remove a subdomain.
+
+| Argument / Option | Description |
+| --- | --- |
+| `<subdomain>` | The subdomain to delete. |
+| `-y`, `--yes` | Skip the confirmation prompt. |
+
+### `puter worker deploy`
+
+Deploy a JavaScript file as a serverless worker at `<name>.puter.work`, or replace an existing one.
+
+| Argument | Description |
+| --- | --- |
+| `[file]` | The worker's JavaScript file. Prompted for when omitted interactively. |
+| `[name]` | Worker name. Prompted for when omitted interactively. |
+
+In non-interactive mode both arguments are required. Names may use letters, numbers, and hyphens (not at the ends).
+
+### `puter worker list`
+
+List your workers, with their URLs. Takes no arguments.
+
+### `puter worker get`
+
+Show details for one worker.
+
+| Argument | Description |
+| --- | --- |
+| `<name>` | The worker to inspect. |
+
+### `puter worker delete`
+
+Delete a worker and its backing file.
+
+| Argument / Option | Description |
+| --- | --- |
+| `<name>` | The worker to delete. |
+| `-y`, `--yes` | Skip the confirmation prompt. |
+
+### `puter app list`
+
+List the apps registered to your account. Takes no arguments.
+
+### `puter app get`
+
+Show details for one app.
+
+| Argument | Description |
+| --- | --- |
+| `<name>` | The app to inspect. |
+
+### `puter kv connect`
+
+Open an interactive shell against an app's or worker's key-value store.
+
+| Argument | Description |
+| --- | --- |
+| `<identifier>` | The store to connect to: an app name, an app uid (`app-…`), a worker name, or a worker URL (`https://my-api.puter.work`). Ambiguous names resolve to the app. |
+
+Requires a terminal — in a non-interactive context the command exits with an error rather than hanging.
+
+## Environment variables
+
+| Variable | Description |
+| --- | --- |
+| `PUTER_AUTH_TOKEN` | Auth token to use instead of logging in. Takes precedence over the stored token. |
+| `CI` | When set, the CLI runs non-interactively and never prompts. |
