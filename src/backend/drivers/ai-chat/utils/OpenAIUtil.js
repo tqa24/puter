@@ -1,0 +1,791 @@
+import { HttpError } from '@heyputer/backend/src/core/http';
+
+/**
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify it under the
+ * terms of the GNU Affero General Public License as published by the Free
+ * Software Foundation, either version 3 of the License, or (at your option) any
+ * later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more
+ * details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program. If not, see
+ * [https://www.gnu.org/licenses/](https://www.gnu.org/licenses/).
+ */
+
+/**
+ * Process input messages from Puter's normalized format to OpenAI's format May
+ * make changes in-place.
+ *
+ * @param {Message[]} messages - Array of normalized messages
+ * @returns {Message[]} - Array of messages in OpenAI format
+ */
+export const process_input_messages = async (messages) => {
+    for (const msg of messages) {
+        if (!msg.content) continue;
+        if (typeof msg.content !== 'object') continue;
+
+        const content = msg.content;
+
+        for (const o of content) {
+            if (o['image_url'] && !o.type) {
+                o.type = 'image_url';
+            }
+            if (o['video_url'] && !o.type) {
+                o.type = 'video_url';
+            }
+        }
+
+        // coerce tool calls
+        let is_tool_call = false;
+        for (let i = content.length - 1; i >= 0; i--) {
+            const content_block = content[i];
+
+            if (content_block.type === 'tool_use') {
+                if (!msg.tool_calls) {
+                    msg.tool_calls = [];
+                    is_tool_call = true;
+                }
+                msg.tool_calls.push({
+                    id: content_block.id,
+                    type: 'function',
+                    function: {
+                        name: content_block.name,
+                        arguments: JSON.stringify(content_block.input),
+                    },
+                    ...(content_block.extra_content
+                        ? { extra_content: content_block.extra_content }
+                        : {}),
+                });
+                content.splice(i, 1);
+            }
+        }
+
+        if (is_tool_call) msg.content = null;
+
+        // coerce tool results
+        // (we assume multiple tool results were already split into separate messages)
+        for (let i = content.length - 1; i >= 0; i--) {
+            const content_block = content[i];
+            if (content_block.type !== 'tool_result') continue;
+            msg.role = 'tool';
+            msg.tool_call_id = content_block.tool_use_id;
+            msg.content = content_block.content;
+        }
+    }
+
+    return messages;
+};
+
+export const process_input_messages_responses_api = async (messages) => {
+    // Pre-split round-tripped compaction blocks into standalone Responses
+    // compaction input items, preserving any sibling content (e.g. the
+    // assistant's reply text) as its own message. A compaction item represents
+    // prior history, so it precedes the message it was attached to. This avoids
+    // collapsing the whole message into a single compaction item and dropping
+    // the rest of its content.
+    const expanded = [];
+    for (let msg of messages) {
+        // Round-tripped reasoning artifacts become standalone `reasoning`
+        // input items — the shape the Responses API expects them back in —
+        // and precede the message they were attached to, same as compaction.
+        // `reasoning`/`refusal`/`normalized` are output-only fields the input
+        // schema rejects, and a caller replaying a normalized message carries
+        // them along with the details.
+        if (msg && typeof msg === 'object') {
+            const details = msg.reasoning_details;
+            if (
+                details !== undefined ||
+                msg.reasoning !== undefined ||
+                msg.refusal !== undefined ||
+                msg.normalized !== undefined
+            ) {
+                // Rebind to a stripped copy rather than deleting: the driver
+                // reuses this same array across fallback attempts, and these
+                // objects belong to the caller.
+                const {
+                    reasoning_details: _details,
+                    reasoning: _reasoning,
+                    refusal: _refusal,
+                    normalized: _normalized,
+                    ...rest
+                } = msg;
+                msg = rest;
+            }
+            if (Array.isArray(details)) {
+                for (const block of details) {
+                    if (!block || block.type !== 'reasoning') continue;
+                    expanded.push({
+                        type: 'reasoning',
+                        ...(block.id !== undefined ? { id: block.id } : {}),
+                        ...(block.encrypted_content !== undefined
+                            ? { encrypted_content: block.encrypted_content }
+                            : {}),
+                        summary: Array.isArray(block.summary)
+                            ? block.summary
+                            : [],
+                    });
+                }
+            }
+        }
+
+        if (msg && Array.isArray(msg.content)) {
+            const compactionBlocks = msg.content.filter(
+                (c) => c && c.type === 'compaction',
+            );
+            if (compactionBlocks.length > 0) {
+                for (const block of compactionBlocks) {
+                    expanded.push({
+                        type: 'compaction',
+                        ...(block.id !== undefined ? { id: block.id } : {}),
+                        encrypted_content: block.encrypted_content,
+                    });
+                }
+                const rest = msg.content.filter(
+                    (c) => !(c && c.type === 'compaction'),
+                );
+                if (rest.length > 0) {
+                    expanded.push({ ...msg, content: rest });
+                }
+                continue;
+            }
+        }
+        expanded.push(msg);
+    }
+    messages = expanded;
+
+    for (const msg of messages) {
+        const content_as_string = (content) => {
+            if (content === undefined || content === null) return '';
+            if (typeof content === 'string') return content;
+            if (Array.isArray(content)) {
+                return content
+                    .map((part) => {
+                        if (typeof part === 'string') return part;
+                        if (part && typeof part.text === 'string')
+                            return part.text;
+                        if (part && typeof part.content === 'string')
+                            return part.content;
+                        return '';
+                    })
+                    .join('');
+            }
+            if (content && typeof content.text === 'string')
+                return content.text;
+            if (content && typeof content.content === 'string')
+                return content.content;
+            return '';
+        };
+
+        if (msg.role === 'tool') {
+            msg.type = 'function_call_output';
+            msg.call_id = msg.tool_call_id || msg.tool_use_id;
+            msg.output = content_as_string(msg.content);
+            delete msg.role;
+            delete msg.content;
+            delete msg.tool_call_id;
+            delete msg.tool_use_id;
+            delete msg.tool_calls;
+            continue;
+        }
+
+        if (!msg.content) continue;
+        if (typeof msg.content !== 'object') continue;
+
+        const content = msg.content;
+
+        for (const o of content) {
+            if (o['image_url'] && !o.type) {
+                o.type = 'image_url';
+            }
+            if (o['video_url'] && !o.type) {
+                o.type = 'video_url';
+            }
+        }
+
+        // coerce tool calls
+        let is_tool_call = false;
+        for (let i = content.length - 1; i >= 0; i--) {
+            const content_block = content[i];
+            if (
+                content_block.type === 'text' &&
+                (msg.role === 'user' || msg.role === 'system')
+            ) {
+                content_block.type = 'input_text';
+            }
+            if (content_block.type === 'text' && msg.role === 'assistant') {
+                content_block.type = 'output_text';
+            }
+
+            if (content_block.type === 'tool_use') {
+                if (!msg.tool_calls) {
+                    msg.tool_calls = [];
+                    is_tool_call = true;
+                }
+                msg.tool_calls.push({
+                    id: content_block.id,
+                    canonical_id: content_block.canonical_id,
+                    type: 'function',
+                    function: {
+                        name: content_block.name,
+                        arguments: JSON.stringify(content_block.input),
+                    },
+                    ...(content_block.extra_content
+                        ? { extra_content: content_block.extra_content }
+                        : {}),
+                });
+
+                content.splice(i, 1);
+            }
+        }
+
+        // Right now this does NOT support parallel tool calls!
+        // We only allow sequential toolcalling right now so this shouldn't be an issue right now
+        // but this probably needs to be changed in the future to split "one completions message"
+        // into multiple responses inputs.
+        if (is_tool_call) {
+            msg.call_id = msg.tool_calls[0].id;
+            msg.id = msg.tool_calls[0].canonical_id;
+            msg.name = msg.tool_calls[0].function.name;
+            msg.arguments = msg.tool_calls[0].function.arguments;
+            msg.type = 'function_call';
+
+            delete msg.role;
+            delete msg.content;
+            delete msg.tool_calls;
+        }
+
+        // coerce tool results
+        for (let i = content.length - 1; i >= 0; i--) {
+            const content_block = content[i];
+            if (content_block.type !== 'tool_result') continue;
+            msg.type = 'function_call_output';
+            msg.call_id = content_block.tool_use_id;
+            msg.output = content_block.content;
+
+            delete msg.role;
+            delete msg.content;
+        }
+    }
+
+    return messages;
+};
+
+export const create_usage_calculator = ({ model_details }) => {
+    return ({ usage }) => {
+        const tokens = [];
+
+        tokens.push({
+            type: 'prompt',
+            model: model_details.id,
+            amount: usage.prompt_tokens,
+            cost: model_details.cost.input * usage.prompt_tokens,
+        });
+
+        tokens.push({
+            type: 'completion',
+            model: model_details.id,
+            amount: usage.completion_tokens,
+            cost: model_details.cost.output * usage.completion_tokens,
+        });
+
+        return tokens;
+    };
+};
+
+export const extractMeteredUsage = (usage) => {
+    return {
+        prompt_tokens: usage.prompt_tokens ?? 0,
+        completion_tokens: usage.completion_tokens ?? 0,
+        cached_tokens: usage.prompt_tokens_details?.cached_tokens ?? 0,
+    };
+};
+
+// Renames one object's DeepSeek-wire `reasoning_content` to the `reasoning`
+// key Puter exposes, without clobbering an existing `reasoning`.
+const renameReasoningContent = (obj) => {
+    if (obj.reasoning === undefined && obj.reasoning_content !== undefined) {
+        obj.reasoning = obj.reasoning_content;
+    }
+    // Dropped even when `reasoning` already won: a provider sending both
+    // means the same thing twice, and the vendor key is the one Puter does not
+    // expose. Pinned by BytePlusProvider.test.ts / ZAIProvider.test.ts, whose
+    // fixtures name the value 'should-be-dropped'.
+    delete obj.reasoning_content;
+};
+
+/**
+ * Normalize a non-streaming completion result whose provider follows the
+ * DeepSeek wire convention (`reasoning_content` on the message and content
+ * parts) to Puter's `reasoning` key. The streaming path already does this in
+ * create_chat_stream_handler.
+ */
+export const normalizeReasoningContent = (result) => {
+    if (!result || typeof result !== 'object') return;
+    if (!('message' in result) || !result.message) return;
+
+    const message = result.message;
+    renameReasoningContent(message);
+
+    if (!Array.isArray(message.content)) return;
+    for (const part of message.content) {
+        if (part && typeof part === 'object' && !Array.isArray(part)) {
+            renameReasoningContent(part);
+        }
+    }
+};
+
+export const create_chat_stream_handler =
+    ({ deviations, completion, usage_calculator }) =>
+    async ({ chatStream }) => {
+        deviations = Object.assign(
+            {
+                // affected by: Groq
+                index_usage_from_stream_chunk: (chunk) => chunk.usage,
+                // affected by: Mistral
+                chunk_but_like_actually: (chunk) => chunk,
+                index_tool_calls_from_stream_choice: (choice) =>
+                    choice.delta.tool_calls,
+            },
+            deviations,
+        );
+
+        const message = chatStream.message();
+        let textblock = message.contentBlock({ type: 'text' });
+        let toolblock = null;
+        let mode = 'text';
+        const tool_call_blocks = [];
+
+        let last_usage = null;
+        let last_extra_content = null;
+        for await (let chunk of completion) {
+            chunk = deviations.chunk_but_like_actually(chunk);
+            const chunk_usage = deviations.index_usage_from_stream_chunk(chunk);
+            if (chunk_usage) last_usage = chunk_usage;
+            if (chunk.choices.length < 1) continue;
+
+            const choice = chunk.choices[0];
+
+            // Deepseek returns choice.delta.reasoning_content, openrouter returns choice.delta.reasoning.
+            if (choice.delta.reasoning_content || choice.delta.reasoning) {
+                textblock.addReasoning(
+                    choice.delta.reasoning_content || choice.delta.reasoning,
+                );
+                // Q: Why don't "continue" to next chunk here?
+                // A: For now, reasoning_content and content never appear together, but I’m not sure if they’ll always be mutually exclusive.
+            }
+
+            if (choice.delta.content) {
+                if (mode === 'tool') {
+                    toolblock.end();
+                    mode = 'text';
+                    textblock = message.contentBlock({ type: 'text' });
+                }
+                textblock.addText(choice.delta.content);
+                continue;
+            }
+
+            if (choice.delta.extra_content) {
+                // Gemini specific thing for metadata, we will basically be appending onto the current message by abusing .addText a little
+                // Apps have to choose to handle extra_content themselves, it doesn't seem like theres a way we can do it in a backwards
+                // compatible fashion since most streaming apps will handle chat history by continuously updating content themselves
+                // This doesn't present us a chance to add in an extra object for gemini's chat continuing features
+                // Don't let a later extra_content chunk without grounding clobber an
+                // earlier one that carried grounding_metadata (used for metering).
+                if (
+                    choice.delta.extra_content.grounding_metadata ||
+                    !last_extra_content?.grounding_metadata
+                ) {
+                    last_extra_content = choice.delta.extra_content;
+                }
+                textblock.addExtraContent(choice.delta.extra_content);
+            }
+
+            const tool_calls =
+                deviations.index_tool_calls_from_stream_choice(choice);
+            if (tool_calls) {
+                if (mode === 'text') {
+                    mode = 'tool';
+                    textblock.end();
+                }
+                for (const tool_call of tool_calls) {
+                    if (!tool_call_blocks[tool_call.index]) {
+                        toolblock = message.contentBlock({
+                            type: 'tool_use',
+                            id: tool_call.id,
+                            name: tool_call.function.name,
+                            ...(tool_call.extra_content
+                                ? { extra_content: tool_call.extra_content }
+                                : {}),
+                        });
+                        tool_call_blocks[tool_call.index] = toolblock;
+                    } else {
+                        toolblock = tool_call_blocks[tool_call.index];
+                    }
+                    toolblock.addPartialJSON(tool_call.function.arguments);
+                }
+            }
+        }
+
+        // TODO DS: this is a bit too abstracted... this is basically just doing the metering now
+        // No usage chunk means there is nothing to meter from — reaching into
+        // a null usage object here used to throw, which took down a response
+        // the upstream had already produced *and* skipped its billing. Leave
+        // the usage undefined instead; the driver charges an estimate for a
+        // stream that produced output nobody reported.
+        const usage = last_usage
+            ? usage_calculator({
+                  usage: last_usage,
+                  extra_content: last_extra_content,
+              })
+            : undefined;
+        // The calculator just metered. Reported here, not only via `end`:
+        // a throw in the block flushes below (a malformed tool-call payload,
+        // say) must not leave a metered stream looking unmetered — the driver
+        // would charge its estimate on top.
+        chatStream.reportUsage(usage);
+
+        if (mode === 'text') textblock.end();
+        if (mode === 'tool') toolblock.end();
+
+        message.end();
+        chatStream.end(usage);
+    };
+
+export const create_chat_stream_handler_responses_api =
+    ({ deviations, completion, usage_calculator }) =>
+    async ({ chatStream }) => {
+        deviations = Object.assign(
+            {
+                // affected by: Groq
+                index_usage_from_stream_chunk: (chunk) => chunk.usage,
+                // affected by: Mistral
+                chunk_but_like_actually: (chunk) => chunk,
+                index_tool_calls_from_stream_choice: (choice) =>
+                    choice.delta.tool_calls,
+            },
+            deviations,
+        );
+
+        const message = chatStream.message();
+        const textblock = message.contentBlock({ type: 'text' });
+        let toolblock = null;
+        const mode = 'text';
+
+        let last_usage = null;
+        for await (const chunk of completion) {
+            if (chunk.type === 'response.output_text.delta') {
+                textblock.addText(chunk.delta);
+                continue;
+            }
+
+            // Reasoning summaries stream as their own delta events; route
+            // them to the same `reasoning` channel the chat-completions
+            // handler uses for Deepseek/OpenRouter, so a streamed reasoning
+            // model reads identically whichever API served it.
+            if (chunk.type === 'response.reasoning_summary_text.delta') {
+                textblock.addReasoning(chunk.delta);
+                continue;
+            }
+
+            // Each summary part is a separate delta stream; separate them with
+            // a blank line, matching the non-stream handler's join.
+            if (
+                chunk.type === 'response.reasoning_summary_part.added' &&
+                chunk.summary_index > 0
+            ) {
+                textblock.addReasoning('\n\n');
+                continue;
+            }
+
+            if (chunk.type === 'response.completed') {
+                last_usage = chunk.response.usage;
+            }
+
+            if (
+                chunk.type === 'response.output_item.done' &&
+                chunk.item?.type === 'compaction'
+            ) {
+                // Inline compaction fired mid-response — normalize the artifact
+                // into the canonical internal compaction event.
+                chatStream.compaction({
+                    id: chunk.item.id,
+                    encrypted_content: chunk.item.encrypted_content,
+                });
+                continue;
+            }
+
+            if (
+                chunk.type === 'response.output_item.done' &&
+                chunk.item?.type === 'function_call'
+            ) {
+                const tool_call = chunk.item;
+                toolblock = message.contentBlock({
+                    type: 'tool_use',
+                    canonical_id: tool_call.id,
+                    id: tool_call.call_id,
+                    name: tool_call.name,
+                    ...(tool_call.extra_content
+                        ? { extra_content: tool_call.extra_content }
+                        : {}),
+                });
+                toolblock.addPartialJSON(tool_call.arguments);
+                toolblock.end();
+            }
+        }
+
+        // TODO DS: this is a bit too abstracted... this is basically just doing the metering now
+        // Missing usage is left undefined rather than fed to the calculator —
+        // see the sibling handler above, including why usage is reported
+        // before the block flushes.
+        const usage = last_usage
+            ? usage_calculator({ usage: last_usage })
+            : undefined;
+        chatStream.reportUsage(usage);
+
+        if (mode === 'text') textblock.end();
+        if (mode === 'tool') toolblock.end();
+
+        message.end();
+        chatStream.end(usage);
+    };
+
+export const handle_completion_output = async (
+    /**
+     * @type {Record<string, unknown> & {
+     *     usage_calculator: (args: {
+     *         usage: import('openai/resources/completions.mjs').CompletionUsage;
+     *     }) => unknown;
+     * }}
+     */
+    { deviations, stream, completion, moderate, usage_calculator, finally_fn },
+) => {
+    deviations = Object.assign(
+        {
+            // affected by: Mistral
+            coerce_completion_usage: (completion) => completion.usage,
+        },
+        deviations,
+    );
+
+    if (stream) {
+        const init_chat_stream = create_chat_stream_handler({
+            deviations,
+            completion,
+            usage_calculator,
+        });
+
+        return {
+            stream: true,
+            init_chat_stream,
+            finally_fn,
+        };
+    }
+
+    if (finally_fn) await finally_fn();
+
+    // Metered before moderation: the completion exists and the upstream has
+    // billed us for it whether or not we go on to withhold it, and running
+    // the moderation gate first meant a flagged completion was served to
+    // nobody and charged to nobody.
+    const ret = completion.choices[0];
+    const completion_usage = deviations.coerce_completion_usage(completion);
+    ret.usage = usage_calculator
+        ? usage_calculator({
+              ...completion,
+              usage: completion_usage,
+          })
+        : {
+              input_tokens: completion_usage.prompt_tokens,
+              output_tokens: completion_usage.completion_tokens,
+          };
+
+    // Providers following the DeepSeek wire convention return
+    // `reasoning_content`; expose it as Puter's `reasoning` key here so every
+    // provider's message carries the same attribute (the streaming path does
+    // the equivalent rename on deltas).
+    normalizeReasoningContent(ret);
+
+    const mod_text = completion.choices[0].message.content;
+    if (moderate && mod_text !== null) {
+        const moderation_result = await moderate(mod_text);
+        if (moderation_result.flagged) {
+            // `code` tells the driver this is a refusal of a completion that
+            // was produced and charged, not a route failure — retrying it on
+            // a fallback provider would bill the account again for another
+            // completion the user will never see.
+            throw new HttpError(400, 'message is not allowed', {
+                legacyCode: 'bad_request',
+                code: 'moderation_flagged',
+            });
+        }
+    }
+
+    return ret;
+};
+
+/**
+ * @param {object} params
+ * @param {Record<string, unknown>} [params.deviations]
+ * @param {boolean} [params.stream]
+ * @param {any} params.completion
+ * @param {((text: string) => Promise<{ flagged: boolean }>) | undefined} [params.moderate]
+ * @param {(args: {
+ *     usage: import('openai/resources/completions.mjs').CompletionUsage;
+ * }) => unknown} params.usage_calculator
+ * @param {() => Promise<void>} [params.finally_fn]
+ * @returns {ReturnType<import('../types').IChatProvider['complete']>}
+ */
+export const handle_completion_output_responses_api = async ({
+    deviations,
+    stream,
+    completion,
+    moderate,
+    usage_calculator,
+    finally_fn,
+}) => {
+    deviations = Object.assign(
+        {
+            // affected by: Mistral
+            coerce_completion_usage: (completion) => completion.usage,
+        },
+        deviations,
+    );
+
+    if (stream) {
+        const init_chat_stream = create_chat_stream_handler_responses_api({
+            deviations,
+            completion,
+            usage_calculator,
+        });
+
+        return {
+            stream: true,
+            init_chat_stream,
+            finally_fn,
+        };
+    }
+
+    if (finally_fn) await finally_fn();
+
+    const output = Array.isArray(completion.output) ? completion.output : [];
+    const responseToolCalls = output
+        .filter((item) => item?.type === 'function_call')
+        .map((item) => ({
+            id: item.call_id,
+            type: 'function',
+            function: {
+                name: item.name,
+                arguments: item.arguments,
+            },
+            ...(item.id ? { canonical_id: item.id } : {}),
+        }));
+
+    // Inline-compaction artifact, if the upstream compacted this turn.
+    const compactionItem = output.find((item) => item?.type === 'compaction');
+
+    const is_empty = completion.output_text.trim() === '';
+    if (is_empty && responseToolCalls.length < 1 && !compactionItem) {
+        // GPT refuses to generate an empty response if you ask it to,
+        // so this will probably only happen on an error condition.
+        // A compaction-only output is legitimate, so don't reject it.
+        throw new HttpError(400, 'an empty response was generated', {
+            legacyCode: 'bad_response',
+        });
+    }
+
+    // Reasoning models return `reasoning` output items; their human-readable
+    // text only exists when the caller requested summaries via
+    // `reasoning: { summary: ... }` (raw chain-of-thought is never returned).
+    const reasoningItems = output.filter((item) => item?.type === 'reasoning');
+    const reasoningText = reasoningItems
+        .flatMap((item) => (Array.isArray(item.summary) ? item.summary : []))
+        .map((part) => (typeof part?.text === 'string' ? part.text : ''))
+        .filter(Boolean)
+        .join('\n\n');
+
+    // The item `id` and `encrypted_content` are what let a caller replay a
+    // reasoning turn into the next request; they are opaque to us and would
+    // otherwise be lost, so they ride `reasoning_details` verbatim — the same
+    // round-trip contract as the `compaction` artifact below and as the
+    // Anthropic thinking blocks the coercer preserves.
+    const reasoningDetails = reasoningItems
+        .filter(
+            (item) =>
+                item.id !== undefined || item.encrypted_content !== undefined,
+        )
+        .map((item) => ({
+            type: 'reasoning',
+            ...(item.id !== undefined ? { id: item.id } : {}),
+            ...(item.encrypted_content !== undefined
+                ? { encrypted_content: item.encrypted_content }
+                : {}),
+            ...(Array.isArray(item.summary) ? { summary: item.summary } : {}),
+        }));
+
+    const ret = {
+        finish_reason: responseToolCalls.length ? 'tool_calls' : 'stop',
+        index: 0,
+        message: {
+            content: completion.output_text,
+            // String-or-absent, matching every other provider's `reasoning`.
+            ...(reasoningText ? { reasoning: reasoningText } : {}),
+            ...(reasoningDetails.length
+                ? { reasoning_details: reasoningDetails }
+                : {}),
+            refusal: null,
+            role: 'assistant',
+            ...(responseToolCalls.length
+                ? { tool_calls: responseToolCalls }
+                : {}),
+        },
+    };
+    ret.role = output.find((item) => item?.role)?.role ?? 'assistant';
+
+    if (compactionItem) {
+        // Include `type` so the artifact is a drop-in `messages` item for the
+        // stateless round-trip — symmetric with the streaming compaction chunk.
+        ret.compaction = {
+            type: 'compaction',
+            ...(compactionItem.id !== undefined
+                ? { id: compactionItem.id }
+                : {}),
+            encrypted_content: compactionItem.encrypted_content,
+        };
+    }
+
+    delete ret.type;
+
+    // Metered before moderation, same as the sibling handler above: the
+    // completion exists and the upstream has billed us for it whether or not
+    // we go on to withhold it.
+    ret.usage = usage_calculator
+        ? usage_calculator({
+              ...completion,
+              usage: completion.usage,
+          })
+        : {
+              input_tokens: completion.usage.input_tokens,
+              output_tokens: completion.usage.output_tokens,
+          };
+
+    const mod_text = completion.output_text;
+    if (moderate && mod_text !== null) {
+        const moderation_result = await moderate(mod_text);
+        if (moderation_result.flagged) {
+            throw new HttpError(400, 'message is not allowed', {
+                legacyCode: 'bad_request',
+                code: 'moderation_flagged',
+            });
+        }
+    }
+
+    return ret;
+};
